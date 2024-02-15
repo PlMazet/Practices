@@ -1,0 +1,1166 @@
+---
+title: Projet - Reconnaissance de langues écrites
+subtitle: |
+  | Unsupervised Learning
+  | M2 Data Science
+author: "Paul Mazet, Etienne Gaucher"
+output:
+  prettydoc::html_pretty:
+    toc: true
+    toc_depth: 1
+    number_sections: true
+    css: style.css
+---
+
+# - Base de textes
+
+## Base de fichiers & dataset 
+
+Nous avons constitué une base de fichiers de 45 textes, dont 18 sont en anglais et 27 sont en français. La base de fichiers se situe dans le dossier `texts`. Dans la suite de l'exercice, on cherche à construire un tableau de fréquence de caractère pour chaque langue. Un traitement des textes s'impose auparavant, car nous disposons uniquement des textes bruts.
+On réalise les étapes suivantes pour chaque texte afin d'obtenir des textes "nettoyés" :
+
+- on élimine les signes de ponctuation
+- on supprime les caractères spéciaux comme les backslash, antislash, apostrophe, le symbole degré...
+- on supprime les éventuels chiffres
+- on remplace les lettres accentuées par les lettres non accentuées et le c cédille par le c basique
+- on remplace les majuscules par des minuscules
+
+Nous avons choisi de remplacer les lettres accentuées car sinon, la reconnaissance de langues est élémentaire étant donné qu'il n'y a pas d'accent dans la langue anglaise. La problématique serait facilement résolue, notre choix apporte donc plus de défi.
+
+On importe les textes sous forme d'un dataframe $(x_i,y_i)_{i = 1, \dots, n}$ où $\forall i$, $x_i$ est le texte et $y_i$ la langue du texte. Les textes en anglais correspondent à $y_i = 1$, tandis que les textes en français sont caractérisés par $y_i = -1$.
+
+```{r, warning = FALSE, message = FALSE}
+# Import de tidyverse pour utiliser le pipe %>%
+library(tidyverse)
+
+# Import de tm pour utiliser des fonctions sur les textes
+library(tm)
+
+recup_data <- function(path = "./texts/")
+{
+  # Récupère les fichiers du path pour construire le dataframe (X,Y) après traitement des textes
+  
+  # Input : chemin relatif (depuis le dossier où est stocké le .rmd) vers le dossier contenant les textes (sous format .txt pour chaque texte)
+  
+  # Output : dataframe décrit précédemment
+  
+  # Définition de y (les 18 premiers textes du dossier sont en anglais, les 27 autres sont en français)
+  vector_lang <- c(rep(1,18),rep(-1,27))
+  
+  # Liste des textes
+  L_text <- list() 
+  
+  i <- 1
+  
+  # Boucle for sur l'ensemble des fichiers .txt présents dans le dossier path
+  for(t in list.files(path, pattern="txt")){
+    L_text[[i]] <- readLines(paste("./texts/",t, sep = ""), encoding = 'UTF-8') %>% 
+      paste(collapse=" ") %>%
+      unlist %>% 
+      
+      # Supprime les caractères spéciaux et les signes de ponctuation
+      str_remove_all("[,?:;°.–…!—‘“/”'’\"-]") %>%
+      str_remove_all("\\(") %>%
+      str_remove_all("\\)") %>%
+      str_remove_all("\\«") %>%
+      str_remove_all("\\»") %>%
+      str_remove_all("\\[") %>%
+      str_remove_all("\\]") %>%
+      
+      # Retire les chiffres
+      removeNumbers() %>%
+      
+      # Transforme les majuscules en minuscules
+      str_to_lower() %>%
+      
+      # Remplace les lettres accentuées
+      chartr(old = "àáâäãèéêëìíîïòóôöõùúûüýÿçñœæ", new = 'aaaaaeeeeiiiiooooouuuuyycnea')
+      
+      i <- i+1
+  }
+  
+  return(data.frame(
+    x = unlist(L_text), 
+    y = vector_lang
+    ))
+}
+
+# Création du dataset avec les textes
+dataset <- recup_data()
+
+# Dimension
+dim(dataset)
+```
+
+## Tableau des log-fréquences X
+
+Une fois que chaque texte a subi le traitement et que le dataset est créé, on peut passer à l'étape suivante : les fréquences. On veut connaître la fréquence de chaque lettre pour chacun des textes.
+Cependant, on ne va pas calculer exactement la fréquence de chaque lettre, mais $\log(1+f)$ avec $f$ la fréquence. Le symbole espace n'est pas pris en compte ici.
+La fonction `table()` renvoie le nombre d'occurrences de chaque lettre pour un texte donné. Mais certaines lettres ne sont pas présentes dans tous les textes, d'où la fonction `normalize1` qui ajoute des occurrences nulles pour les lettres absentes.
+
+La fonction `table_of_dataset` retourne le tableau des occurrences de chaque lettre pour tous les textes, ce qui permet ensuite de trouver les log-fréquences à l'aide de la fonction `matrix_logfrequency`.
+
+```{r}
+normalize1 <- function(table_letter, names_character){
+  # Ajout des caractères manquants à la table d'effectif des caractères d'un texte (occurrences nulles)
+  
+  # Inputs : 
+  # "table_letter" : Tableau d'effectif des caractères d'un texte
+  # "names_character" : Ensemble des caractères possibles
+  
+  # Output : 
+  # "res" : Tableau complet d'effectif de chaque caractère (dans un texte)
+  
+  N <- length(names_character)
+  
+  # Si aucun caractère ne manque, on retourne le tableau
+  if (length(table_letter)==N){ return(table_letter) }
+  
+  else{
+    # Création d'un vecteur nul
+    res <- rep(0,N)
+    
+    names(res) <- names_character
+    
+    # Remplace les occurrences nulles par les valeurs de table_letter lorsque le caractère est présent dans le texte
+    for (character in names(table_letter))
+    {
+      res[character] <- table_letter[character] 
+    }
+    
+    return (res)
+  }
+}
+
+table_of_dataset <- function(dataset){
+  # Tableau d'effectif par texte
+
+  # Input :
+  # "dataset" : Dataset [Dataframe (X,Y)]
+  
+  # Output :
+  # "table.res" : Tableau d'effectif de chaque caractère pour chaque texte + dernière colonne indiquant la langue du texte
+  
+  # Vecteur des lettres
+  character_list <- c("a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z")
+  
+  # Nombre de textes dans la liste
+  n <- length(dataset$x)
+  # Nombre de lettres
+  m <- length(character_list)
+  
+  table.res <- matrix(0,n,m+1)
+  colnames(table.res) <- c(character_list, "lang")
+  
+  # Boucle for sur les textes de la liste
+  for (t in (1:n)) 
+  {
+    # Création d'une table avec le nombre d'occurrences de chaque lettre du texte
+    table_letter <- strsplit(as.vector(dataset$x[t]), split="") %>% unlist() %>% table()
+    
+    # On enlève le nombre d'espace et on ajoute les éventuelles lettres manquantes avec la fonction normalize1
+    table_letter <- normalize1(table_letter[-1], character_list)
+    
+    # On ajoute la dernière colonne "lang"
+    table.res[t,] <- c(table_letter, dataset$y[t])
+  }
+  
+  return(table.res)
+}
+
+# Test
+#table = table_of_dataset(dataset)
+#print(table)
+
+matrix_logfrequency <- function(dataset){
+  # Tableau des log-fréquences des caractères pour chaque texte
+  
+  # Input :
+  # "dataset" : Dataset [Dataframe (X,Y)]
+  
+  # Output :
+  # "matrix.res" : Tableau de la log-fréquence de chaque caractère pour chaque texte + dernière colonne indiquant la langue du texte
+  
+  X <- table_of_dataset(dataset)
+  n <- dim(X)[2]
+  
+  # Calcul des log-fréquences de chaque texte
+  matrix.res <- cbind(log(1 + (X[,-n] / rowSums(X[,-n]))), X[,n])
+  
+  return(matrix.res)
+}
+
+# Resultat Q2
+logf <- matrix_logfrequency(dataset)
+head(logf)
+```
+
+## Histogrammes des log-fréquences des symboles
+
+On veut tracer l'histogramme des log-fréquences des caractères pour les textes en anglais et les textes en français. On ne peut pas faire la moyenne des log-fréquences obtenues à la question 2, car cela est mathématiquement incorrect. On doit redémarrer des effectifs de chaque texte, et les sommer selon la langue avant de calculer la log-fréquence.
+
+```{r}
+# Import de ggplot2 pour tracer les histogrammes
+library(ggplot2)
+
+prepare_for_hist <- function(dataset){
+  # Préparation des données pour l'histogramme
+  
+  # Input :
+  # "dataset" : Dataset [Dataframe (X,Y)]
+  
+  # Output :
+  # "dataf_hist" : Dataframe à 3 colonnes (caractère - fréquence du caractère - langue associée à la fréquence)
+  
+  X <- table_of_dataset(dataset)
+  n <- dim(X)[2]
+  
+  # Tableau des log-fréquences des caractères pour chaque langue
+  X_fr <- as.vector(colSums(X[which(X[,n]==-1),-n]))
+  X_fr <- log(1 + (X_fr / sum(X_fr)))
+  X_en <- as.vector(colSums(X[which(X[,n]==1),-n]))
+  X_en <- log(1 + (X_en / sum(X_en)))
+  
+  # Dataframe à 3 colonnes (caractère - fréquence du caractère - langue associée à la fréquence) et à 2*m ligne où m le nombre de caractère
+  caract <- rep(colnames(X)[-n],2)
+  freq <- c(X_fr,X_en)
+  lang <- c(rep(-1,n-1),rep(1,n-1))
+  dataf_hist <- data.frame("caractere" = caract,
+                          "frequence" = freq,
+                          "langage" = lang)
+  
+  return(dataf_hist)
+}
+
+# Résultat Q3 :
+dataf_hist <- prepare_for_hist(dataset)
+# Test : print(dataf_hist)
+
+
+# Histogramme pour les textes anglais
+ggplot(dataf_hist[dataf_hist$langage == 1,], aes(x=caractere, y=frequence)) +
+  geom_bar(stat="identity", color="darkblue", fill="lightblue") +
+  labs(title="Histogramme des log-fréquences des symboles pour les textes anglais") +
+  xlab("caractère") +
+  ylab("log-fréquence")
+
+# Histogramme pour les textes français
+ggplot(dataf_hist[dataf_hist$langage == -1,], aes(x=caractere, y=frequence)) +
+  geom_bar(stat="identity", color="darkblue", fill="lightblue") +
+  labs(title="Histogramme des log-fréquences des symboles pour les textes français") +
+  xlab("caractère") +
+  ylab("log-fréquence")
+
+# Histogramme de comparaison
+ggplot(dataf_hist, aes(x=caractere, y=frequence, color = as.factor(langage))) +
+  geom_bar(stat="identity", position=position_identity(), fill ="NA") +
+  labs(title="Histogramme des log-fréquences des symboles selon la langue") +
+  xlab("caractère") +
+  ylab("log-fréquence") +
+  scale_color_discrete(name = "Langue", labels = c("Français", "Anglais"))
+```
+
+Le dernier histogramme nous montre que des lettres sont beaucoup plus fréquentes dans une langue que l'autre. Par exemple, les lettres e, q, s et u sont plus courantes en français, alors que les lettres h, w, et y sont plus courantes en anglais. Notre classifieur de Bayes naïf va utiliser ces propriétés pour prédire la langue d'un texte.
+
+# - Classifieur de Bayes naïf
+
+## Estimation des paramètres
+
+On cherche à construire un classifieur de Bayes naïf pour prédire la langue d'un texte. Notre première tâche consiste à estimer les paramètres du modèle, c'est-à-dire les moyennes et les variances pour chaque classe du jeu d'apprentissage. Dans notre cas, il y a deux classes : anglais et français.
+
+Les notations utilisées sont les suivantes :
+
+-  $\hat{p}_{anglais}$ probabilité marginale que le texte soit en anglais. On l'estime par $\hat{p}_{anglais} = \frac{1}{n} \sum \limits_{i=1}^n \mathbb{1}_{y_i=1}$ avec $n$ le nombre de textes dans le jeu d'apprentissage, et $y$ la langue du texte
+
+-  $\hat{p}_{français}$ probabilité marginale que le texte soit en français. On l'estime par $\hat{p}_{français} = \frac{1}{n} \sum \limits_{i=1}^n \mathbb{1}_{y_i=-1}$ avec $n$ le nombre de textes dans le jeu d'apprentissage, et $y$ la langue du texte
+
+- $x$ = $\begin{pmatrix} \log(f_a +1) \\ \vdots \\  \log(f_z +1)\end{pmatrix} \in \mathbb{R}^{26}$ vecteur des log-fréquences du texte à classifier
+
+- $\mu_{anglais} = \begin{pmatrix} \mu_{\text{log_fréq a, anglais}} & \cdots & \mu_{\text{log_fréq z, anglais}} \end{pmatrix} \in \mathbb{R}^{26}$ moyennes des log-fréquences des textes en anglais du jeu d'apprentissage
+
+- $\mu_{français} = \begin{pmatrix} \mu_{\text{log_fréq a, français}} & \cdots & \mu_{\text{log_fréq z, français}} \end{pmatrix} \in \mathbb{R}^{26}$ moyennes des log-fréquences des textes en français du jeu d'apprentissage
+
+- $\sigma_{anglais}^2 I_p \in \mathbb{R}^{26 \times 26}$ variances des log-fréquences des textes en anglais du jeu d'apprentissage
+
+- $\sigma_{français}^2 I_p \in \mathbb{R}^{26 \times 26}$ variances des log-fréquences des textes en français du jeu d'apprentissage
+
+- $\hat{\pi}(anglais|x)$ probabilité que le texte à classifier soit en anglais
+
+- $\hat{\pi}(français|x)$ probabilité que le texte à classifier soit en français
+
+Dans le cadre du modèle de Bayes naïf, on a
+$$
+\hat{\pi}(k|x) = \frac{\hat{p}_{k} .f_k(x|\hat{\theta_k})}{\sum \limits_{l=1}^2 \hat{p}_{l} .f_l(x|\hat{\theta_l})} \propto \hat{p}_{k} .f_k(x|\hat{\theta_k})
+$$
+
+On ne calculera donc pas le dénominateur pour prédire la langue d'un texte.
+
+La fonction `compute_param` estime les paramètres de moyennes et variances des classes d'un jeu d'apprentissage. Le vecteur passé en argument correspond aux index des textes du jeu d'apprentissage.
+
+```{r}
+compute_param <- function(index_train, matrix_logfreq)
+{
+  # Liste des paramètres de moyennes et variances des classes d’un jeu d’apprentissage
+  
+  # Inputs :
+  # "index_train" : vector, index des textes du jeu d'apprentissage
+  # "matrix_logfreq" : matrix, matrice des log-fréquences de l'ensemble des textes
+  
+  # Output :
+  # Moyennes et variances des log-fréquences des textes du jeu d'apprentissage pour les classes anglais et français
+  
+  logf_train <- matrix_logfreq[index_train, ]
+  
+  # Estimation des moyennes
+  mu_en <- apply(logf_train[logf_train[, ncol(logf_train)] == 1, -ncol(logf_train)], 2, mean)
+  mu_fr <- apply(logf_train[logf_train[, ncol(logf_train)] == -1, -ncol(logf_train)], 2, mean)
+  
+  # Estimation des variances
+  var_en <- apply(logf_train[logf_train[, ncol(logf_train)] == 1, -ncol(logf_train)], 2, var)
+  var_fr <- apply(logf_train[logf_train[, ncol(logf_train)] == -1, -ncol(logf_train)], 2, var)
+ 
+  return(list(
+    "mu_en" = mu_en,
+    "mu_fr" = mu_fr,
+    "var_en" = diag(var_en),
+    "var_fr" = diag(var_fr)
+  )) 
+}
+```
+
+## Le classifieur
+
+On définit ensuite la fonction `naive_bayes` qui, pour un ensemble de textes passé en argument, renvoie la langue prédite par le classifieur. Puisque les log-fréquences de chaque texte ont déjà été calculées à l'exercice 1, on passera plutôt en argument les index des textes à classifier. Les index des textes constituants le jeu d'apprentissage sont également un argument de la fonction, ce qui facilitera l'implémentation de la validation croisée dans la question suivante.
+
+```{r, message = FALSE, warning = FALSE}
+# Import de mvtnorm pour la densité d'une loi normale multivariée
+library(mvtnorm)
+
+naive_bayes <- function(index_test, index_train, matrix_logfreq)
+{
+  # Prédiction de la langue des textes du jeu de données test à partir du jeu d'apprentissage
+    
+  # Inputs :
+  # "index_test" : vector, index des textes à classifier
+  # "index_train" : vector, index des textes du jeu d'apprentissage
+  # "matrix_logfreq" : matrix, matrice des log-fréquences de l'ensemble des textes
+  
+  # Output :
+  # Liste des prédictions pour les textes du jeu de données test
+  
+  # Vecteur des prédictions
+  y_pred <- c()
+  
+  # Estimation des paramètres sur le jeu d'apprentissage
+  param <- compute_param(index_train, matrix_logfreq)
+  
+  # Calcul des probabilités marginales
+  prob_en <- sum(matrix_logfreq[index_train, ncol(matrix_logfreq)]==1)/length(index_train)
+  prob_fr <- 1-prob_en
+  
+  j <- 1
+  
+  # Boucle for sur le jeu de données test
+  for(i in index_test)
+  {
+    # Calcul des probabilités sans division du dénominateur
+    pi_en <- prob_en * dmvnorm(matrix_logfreq[i,-c(ncol(matrix_logfreq))], param$mu_en, param$var_en)
+    pi_fr <- prob_fr * dmvnorm(matrix_logfreq[i,-c(ncol(matrix_logfreq))], param$mu_fr, param$var_fr)
+    
+    y_pred[j] <- ifelse(pi_en > pi_fr, 1, -1)
+    
+    j <- j + 1
+  }
+  
+  return(y_pred)
+}
+```
+
+## Estimation des performances par validation croisée
+
+Pour connaître les performances de notre classifieur, on utilise la validation croisée. On divise notre jeu de données en 5 folds, en faisant attention à stratifier sur la langue pour toujours avoir des textes anglais et français dans nos jeux d'apprentissage. La fonction `perf_nb` renvoie la matrice de confusion du classifieur.
+
+```{r, warning = FALSE, message = FALSE}
+# Import de splitTools pour la création des folds
+library(splitTools) 
+
+# Import de caret pour la matrice de confusion
+library(caret)
+
+perf_nb <- function(matrix_logfreq)
+{
+  # Estimation des performances du classifieur de Bayes naïf par validation croisée
+    
+  # Input :
+  # "matrix_logfreq" : matrix, matrice des log-fréquences de l'ensemble des textes
+  
+  # Output :
+  # Matrice de confusion
+  
+  # Création des folds
+  kfolds <- create_folds(matrix_logfreq[, ncol(matrix_logfreq)], k=5, type="stratified")
+  
+  # Vecteur des langues
+  y_theo <- c()
+  
+  # Vecteur des prédictions
+  y_pred <- c()
+  
+  # Boucle for sur les folds
+  for (fold in kfolds) 
+  {
+    # Ajout des valeurs théoriques
+    y_theo <- c(y_theo, matrix_logfreq[which(!(1:nrow(matrix_logfreq) %in% fold)), ncol(matrix_logfreq)])
+    
+    # Ajout des prédictions
+    y_pred <- c(y_pred,
+                naive_bayes(which(!(1:nrow(matrix_logfreq) %in% fold)), fold, matrix_logfreq))
+  }
+  
+  return(confusionMatrix(data=as.factor(y_pred), 
+                         reference = as.factor(y_theo)))
+  
+}
+
+perf_nb(logf)
+```
+
+Le classifieur de Bayes naïf a d'excellentes performances  puisqu'il ne réalise aucune erreur. Il a su prédire parfaitement la langue pour tous les textes, et semble ainsi être un outil fiable et efficace.
+
+
+# - Classifieur markovien
+
+## Estimation des paramètres
+
+On estime les paramètres de Markov (distribution initiale $\pi$ et matrice de transition $A$) par estimateur du maximum de vraisemblance (MLE), on trouve alors :
+
+- $\forall i \in$ {a, b,..., z}, $\pi_i$ = $\frac{N_i}{\sum_{k=1}^{n} N_k}$ 
+
+- $\forall j,i \in$ {a, b,..., z}, $A_{ji}$ = $\frac{N_{ji}}{\sum_{k=1}^{n} N_{jk}}$ 
+
+où $N_{ji}$ est le nombre de passage de caractère j à i, et $N_k$ est le nombre de caractère k.
+
+Cependant, il est préférable d'estimer la distribution initiale $\pi$ et la matrice de transition $A$ par la quantité $\log(1 + \text{estimation})$, sinon la vraisemblance peut devenir très petite et être interprétée par 0 par la machine. Il serait alors impossible de comparer les vraisemblances pour chaque langue.
+
+```{r}
+unigram <- function(dataset){
+  # Unigram des caractères pour chaque langue
+
+  # Input :
+  # "dataset" : Dataset [Dataframe (X,Y)]
+  
+  # Output :
+  # Liste des unigrams (Tableau d'effectif de caractère) pour chaque langue
+  
+  X = table_of_dataset(dataset)
+  n = dim(X)[2]
+  
+  # Unigram pour les textes français
+  unigram_fr = as.vector(colSums(X[which(X[,n]==-1),-n]))
+  names(unigram_fr) = colnames(X)[-n]
+  
+  # Unigram pour les textes anglais
+  unigram_en = as.vector(colSums(X[which(X[,n]==1),-n]))
+  names(unigram_en) = colnames(X)[-n]
+  
+  return(list(
+    "fr" = unigram_fr,
+    "en" = unigram_en
+    ))
+}
+
+# Test :
+# dataset_unigrams = unigram(dataset)
+# print(dataset_unigrams)
+
+
+normalize2 <- function(bigram, character_list){
+  # Ajout des caractères manquants au bigram des caractères d'un texte
+  
+  # Inputs : 
+  # "bigram" : Bigram des caractères d'un texte
+  # "names_character" : Ensemble des caractères possibles
+  
+  # Output : 
+  # "res" : bigram complet de chaque caractère (dans un texte)
+  
+  N = length(character_list)
+  
+  # Si aucune cellule ne manque, on retourne le tableau
+  if ( (dim(bigram)[1]==N) && (dim(bigram)[2]==N) ) { return(bigram) }
+  
+  else{
+    # Création d'une matrice nulle
+    res = matrix(0,N,N)
+    rownames(res) = character_list
+    colnames(res) = character_list
+    
+    # Remplace les occurrences nulles par les valeurs du bigram
+    for (letteri in rownames(bigram)){
+      for (letterj in colnames(bigram)){
+        res[letteri,letterj]=bigram[letteri,letterj]
+      }
+    }
+    
+  return (res)
+  }
+}
+
+bigram <- function(dataset){
+  # Bigram des caractères pour chaque langue
+
+  # Input :
+  # "dataset" : Dataset [Dataframe (X,Y)]
+  
+  # Output :
+  # Liste des bigrams (Tableau d'effectif de passage de caractères) pour chaque langue
+  
+  # On ajoute l'espace dans la liste des caractères
+  character_list = c(" ", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z") 
+  m = length(character_list)
+  
+  # Création des matrices nulles
+  bigram_fr = matrix(0,m,m)
+  bigram_en = matrix(0,m,m)
+  
+  n = length(dataset$x)
+  
+  for (t in (1:n)) {
+    text = as.vector(dataset$x[t])
+    xt1 = strsplit(paste(" ",text, sep=""), split="") %>% unlist()
+    xt2 = strsplit(paste(text, " ", sep=""), split="") %>% unlist()
+    bigrams = table(xt1,xt2)
+    
+    # On ajoute les éventuelles cellules manquantes avec la fonction normalize2
+    bigrams = normalize2(bigrams, character_list)
+    if (dataset$y[t] == 1){bigram_en = bigram_en + bigrams}
+    else{bigram_fr = bigram_fr + bigrams}
+  }
+  
+  return(list(
+    "fr" = bigram_fr,
+    "en" = bigram_en
+    ))
+}
+
+# Test :
+# dataset_bigrams = bigram(dataset)
+# print(dataset_bigrams)
+
+normalize3 <- function(bigram, epsilon=10e-7){
+  # Ajout d'epsilon aux valeurs nulles des bigrams + suppression transition espace-espace
+  
+  # Inputs : 
+  # "bigram" : bigram des caractères d'une langue
+  # "epsilon" : quantité ajoutée aux valeurs nulles
+  
+  # Output : 
+  # "res" : bigram
+  
+  res = bigram
+  
+  for (letteri in rownames(res)){
+    for (letterj in colnames(res)){
+      # Remplace les occurrences nulles par epsilon
+      if (res[letteri,letterj]==0){
+        res[letteri,letterj] = epsilon
+      }
+    }
+  }
+  
+  # On enlève les enchaînements espace-espace
+  res[1,1] = 0
+  
+  return (res)
+}
+
+estimation_Markov <- function(unigram, bigram){
+  # Estimation des paramètres de markov pour une langue donnée
+
+  # Input :
+  # "dataset" : unigram & bigram pour une langue
+  
+  # Output : Liste des paramètres de Markov
+  # "pi" : Distribution initiale
+  # "A" : Matrice de transition
+  
+  # Préparation du bigram
+  bigram = normalize3(bigram) 
+  
+  pi = unigram / sum(unigram)
+  A = bigram / rowSums(bigram)
+  
+  return(list(
+    "distrib_init" = pi,
+    "mat_transition" = A
+    ))
+}
+
+dataset_unigrams = unigram(dataset)
+dataset_bigrams = bigram(dataset)
+
+Markov_FR = estimation_Markov(dataset_unigrams$fr, dataset_bigrams$fr)
+Markov_EN = estimation_Markov(dataset_unigrams$en, dataset_bigrams$en)
+
+# Test :
+# print(Markov_FR)
+# print(Markov_EN)
+
+```
+
+```{r}
+heatmap(dataset_bigrams$fr)
+```
+
+##  MLE & Classifieur
+
+```{r}
+
+logprob_markov <- function(param, text_vector){
+  # Probabilité "ajustée" (On additionne log(1+f)) d'un texte modélisé comme une chaine de markov de caractère
+
+  # Inputs :
+  # "text_vector" : Vecteur de caractère
+  # "param" : Paramètres de markov pi et A
+  
+  # Output : Langue estimée du texte (-1 ou 1)
+  n = length(text_vector)
+  res = log(1 + param$distrib_init[text_vector[1]])
+  for (i in 2:n) {
+    res = res + log(1 + param$mat_transition[text_vector[i-1],text_vector[i]])
+  }
+  return(res)
+}
+
+classifieur_Markovien <- function(text, Markov_FR, Markov_EN){
+  # Prédiction de la langue d'un texte en le modélisant comme une chaîne de Markov
+  
+  # Inputs :
+  # "text" : Texte dont il faut prédire la langue (format : dataset$x[i])
+  # "Markov_FR, Markov_EN" : Paramètres de markov pi et A pour chaque langue
+  
+  # Output : Prédiction de la langue du texte (-1 ou 1)
+  
+  # Transforme le texte en vecteur de caractère
+  text_vector = strsplit(as.vector(text), split="") %>% unlist()
+  
+  # Si le texte commence par un espace, on le supprime
+  if (text_vector[1] == " "){text_vector = text_vector[-1]} 
+  
+  
+  # Vraisemblance "ajustée" (on additionne log(1+f))
+  ML_fr = logprob_markov(Markov_FR, text_vector)
+  ML_en = logprob_markov(Markov_EN, text_vector)
+  
+  
+  # Langue la plus probable selon les calculs
+  if (ML_fr > ML_en){ return(-1) }
+  else{ return(1) }
+}
+
+# Test 
+# for (i in 1:length(dataset$x)) {
+#  cat(sprintf("Variable 'lang' prédite par le classifieur pour le texte %s : %s \n", #i, classifieur_Markovien(dataset$x[i], Markov_FR, Markov_EN)))
+#}
+
+```
+
+## Validation croisée
+
+```{r}
+# Import de splitTools pour la création des folds
+library(splitTools) 
+
+# Import de caret pour la matrice de confusion
+library(caret)
+
+# Kfold stratifié
+kfolds = create_folds(dataset$y, k=5, type="stratified") 
+
+y_theo = c()
+y_pred = c()
+for (fold in kfolds) {
+  
+  # Partition entraînement/évaluation
+  data_train = dataset[fold,]
+  data_val = dataset[-fold,]
+  
+  # Apprentissage
+  train_unigrams = unigram(data_train)
+  train_bigrams = bigram(data_train)
+  Markov_FR = estimation_Markov(train_unigrams$fr, train_bigrams$fr)
+  Markov_EN = estimation_Markov(train_unigrams$en, train_bigrams$en)
+  
+  # Évaluation 
+  
+  res = c()
+  for (i in 1:length(data_val$x)) {
+    res = c(res, classifieur_Markovien(data_val$x[i], Markov_FR, Markov_EN))
+  }
+  
+  # Ajout des valeurs théoriques
+  y_theo = c(y_theo, data_val$y)
+  # Ajout des prédictions
+  y_pred = c(y_pred, res)
+
+  #print(res)
+  #print(data_val$y)
+}
+# Comparaison par matrice de confusion
+confusionMatrix(data=as.factor(y_pred), reference = as.factor(y_theo))
+```
+
+# - Décodage de langue par Viterbi
+
+## Création du texte aléatoire
+
+On doit créer un court texte d'au plus 1 000 caractères enchaînant de manière aléatoire des phrases en français et en anglais. 
+Tout d'abord, on importe les phrases de tous les textes sous forme d'un dataframe $(x_i,y_i)_{i = 1, \dots, n}$ où $\forall i$, $x_i$ est une phrase et $y_i$ la langue de la phrase.
+Les phrases en anglais correspondent à $y = 1$, tandis que les phrases en français sont caractérisées par $y = -1$. La fonction `recup_sentences` s'inspire de la fonction `recup_data` et permet de créer le dataframe. Pour différencier les phrases, nous utilisons les signes de ponctuation suivants : point, point d'interrogation, point d'exclamation. Le dataset contient cependant quelques erreurs inévitables en raison des signes de ponctuation utilisés dans des cas précis, par exemple "M.de Balzac", "U.S.A", ou les onomatopées. Pour résoudre ce problème, le dataset ne comportera que des phrases d'au moins 20 caractères.
+
+```{r, warning = FALSE}
+# Import de sbo pour utiliser la fonction tokenize_sentences
+library(sbo)
+
+recup_sentences <- function(path = "./texts/"){
+  # Même fonction que la fonction recup_data() mais pour chaque phrase
+  
+  # Input : chemin relatif (depuis le dossier où est stocké le .rmd) vers le dossier contenant les textes (sous format .txt pour chaque texte)
+  
+  # Output : dataframe décrit précédemment
+  
+  # Vecteur des langues des textes (les 18 premiers textes du dossier sont anglais, les 27 autres sont français)
+  vector_lang = c(rep(1,18),rep(-1,27))
+  
+  # Liste des phrases et de la langue associée
+  sentences = c() 
+  lang_of_sentences = c() 
+  
+  i = 1
+  
+  # Boucle for sur l'ensemble des fichiers .txt présents dans le dossier path
+  for(t in list.files(path, pattern="txt")){
+    text <- readLines(paste("./texts/",t, sep = ""), encoding = 'UTF-8') %>% 
+      paste(collapse=" ") %>%
+      unlist %>% 
+      
+      # Supprime les caractères spéciaux et les signes de ponctuation sauf "?!."
+      str_remove_all("[,:;°–…—‘“/”'’\"-]") %>%
+      str_remove_all("\\(") %>%
+      str_remove_all("\\)") %>%
+      str_remove_all("\\«") %>%
+      str_remove_all("\\»") %>%
+      str_remove_all("\\[") %>%
+      str_remove_all("\\]") %>%
+      
+      # Retire les chiffres
+      removeNumbers() %>%
+      
+       # Transforme les majuscules en minuscules
+      str_to_lower() %>%
+      
+      # Remplace les lettres accentuées
+      chartr(old = "àáâäãèéêëìíîïòóôöõùúûüýÿçñœæ", new = 'aaaaaeeeeiiiiooooouuuuyycnea')
+      
+      # Sépare les phrases du texte
+      sentences_by_text = tokenize_sentences(as.vector(text))
+      
+      # Stocke les nouvelles phrases
+      sentences = c(sentences, sentences_by_text)
+      
+      # Stocke la langue des nouvelles phrases = langue du texte
+      lang_of_sentences = c(lang_of_sentences,
+                            rep(vector_lang[i],length(sentences_by_text))
+                            )
+      i = i+1
+  }
+  
+  return(data.frame(
+    x =  sentences,
+    y = lang_of_sentences
+  ))
+}
+
+# Création du dataset avec les phrases
+dataset_sentences = recup_sentences()
+
+# Le dataset ne comportera que des phrases d'au moins 20 caractères.
+dataset_sentences = dataset_sentences[which(nchar(as.vector(dataset_sentences$x))>=20),]
+
+# Aperçu & Dimension
+head(dataset_sentences)
+dim(dataset_sentences)
+```
+
+Une fois que le dataset contenant les phrases est créé, on souhaite générer un texte enchaînant de manière aléatoire des phrases en français et en anglais. Pour générer la première phrase, on choisit par défaut des probabilités de tirage égales aux proportions initiales renvoyées par la fonction `initial_distrib`. Cette fonction calcule la proportion de phrases en anglais et en français dans le dataset pour en déduire les probabilités initiales.
+La fonction `texte_made1` génère ensuite une suite de phrases composant le texte.
+
+```{r}
+initial_distrib <- function(dataset_sentences){
+  # Détermine la distribution initiale (proportions de phrases en anglais et en français)
+  
+  # Input : 
+  # "dataset_sentences" : Dataframe des phrases récupérées et langues associées
+  
+  # Output : distribution initiale 
+  
+  N = length(dataset_sentences$y)
+  
+  # Proportions de phrases en français et en anglais dans le dataset
+  N_fr = length(which(dataset_sentences$y == -1))
+  N_en = N - N_fr
+  
+  # Distribution initiale
+  pi = c(N_fr, N_en)/N
+  
+  return(pi)
+}
+
+text_made1 <- function(pi, mat_transition, dataset_sentences){
+  # Génération d'un texte constitué de phrases anglaises et françaises tirées aléatoirement
+  
+  # Inputs : 
+  # "dataset_sentences" : Dataframe des phrases récupérées et langues associées
+  # "pi, mat_transition" : Paramètres de Markov
+  
+  # Output : Dataframe de même format que l'input, avec les phrases du texte créé
+  
+  # Détermine les index des phrases en français et en anglais
+  indx_fr = which(dataset_sentences$y == -1)
+  indx_en = which(dataset_sentences$y == 1)
+  
+  # Index déjà utilisés pour chaque langue (phrases déjà sélectionnées)
+  indx_fr_taken = c()
+  indx_en_taken = c()
+  
+  # Phrase initiale
+  # Etat 1 : fr (français), état 2 : en (anglais)
+  # Tire aléatoirement un état avec probabilité pi
+  Z = sample.int(2, 1, prob=pi)
+  
+  # Si la première phrase est en français
+  if (Z==1){
+    new_indx = sample(indx_fr, 1)
+    indx_fr_taken = c(indx_fr_taken,new_indx)
+  }
+  
+  # Si la première phrase est en anglais
+  else{
+    new_indx = sample(indx_en, 1)
+    indx_en_taken = c(indx_en_taken,new_indx)
+  }
+  
+  # Stocke le premier index
+  indx.res = new_indx
+  
+  # Nombre de caractères du texte après ajout de la phrase
+  len = nchar(as.vector(dataset_sentences$x[new_indx])) 
+
+  # Tant que le texte créé ne fait pas plus de 1 000 caractères
+  while(len<=1000){
+    # Tire aléatoirement un état avec probabilité définie par mat_transition
+    # Etat 1 : fr (français), état 2 : en (anglais)
+    Z = sample.int(2, 1, prob=mat_transition[Z,])
+    
+    # Si la phrase est en français
+    if (Z==1){
+    
+      # S'il n'y a pas encore eu de phrases en français
+      if (length(indx_fr_taken)==0){ new_indx = sample(indx_fr, 1) }
+      
+      # S'il y a déjà eu des phrases en français
+      else{ new_indx = sample(indx_fr[-indx_fr_taken], 1) }
+      
+      indx_fr_taken = c(indx_fr_taken,new_indx)
+    }
+    
+    # Si la phrase est en anglais
+    else{
+    
+      # S'il n'y a pas encore eu de phrases en anglais
+      if (length(indx_en_taken)==0){ new_indx = sample(indx_en, 1) }
+      
+      # S'il y a déjà eu des phrases en anglais
+      else{ new_indx = sample(indx_en[-indx_en_taken], 1) }
+      indx_en_taken = c(indx_en_taken,new_indx)
+    }
+    
+    # Stocke le nouvel index
+    indx.res = c(indx.res,new_indx)
+    
+    # Nombre de caractères du texte après ajout de la phrase
+    len = len + nchar(as.vector(dataset_sentences$x[new_indx])) 
+    
+    #print(len)
+    #print(new_indx)
+    #print(indx_fr_taken)
+    #print(indx_en_taken)
+    #print(Z)
+    #print(as.vector(dataset_sentences$x[new_indx]))
+  }
+  
+  # On supprime la dernière phrase pour avoir un texte final de moins de 1 000 caractères
+  indx.res = indx.res[-length(indx.res)]
+  
+  # Sélection des phrases & de la langue associée
+  return(dataset_sentences[indx.res,])
+}
+
+pi = initial_distrib(dataset_sentences)
+A = matrix(c(0.2,0.5,0.8,0.5),2)
+
+new_dataset = text_made1(pi, A, dataset_sentences)
+head(new_dataset)
+```
+
+
+## Algorithme de Viterbi
+
+Dans cette partie, nous considérons un modèle de Markov caché où les variables observées $X=(x_{1},x_{2},\dots,x_{T})$ sont des phrases et les états cachés sont les langues possibles dans lesquelles sont écrites les phrases  $S=(s_1 = fr,s_2 =en)$. En ce qui concerne les probabilités d'émission, on modélise les observations (phrases) par des chaînes de Markov de caractères dont les paramètres (distribution initiale et matrice de transition) dépendent de la langue (état caché). Les T phrases générées à la question précédentes sont notées $O={o_1,o_2,…,o_T}$. Elles sont alors définies comme des modalités que peut prendre la variable X, de telle manière que $x_{t}=i$ si la phrase t-ième est $o_{i}$.
+
+Pour les variables cachées, on décide nous-même des paramètres de Markov qui permettent de choisir dans quelle langue nous allons tirer chaque phrase. (On peut choisir une distribution initiale en fonction des proportions). C'est de cette manière que l'on génère les observations dans la question 1.
+
+L'objectif de la méthode Viterbi appliqué à cet exercice est de déterminer les langues dans lesquelles sont écrites chacune des phrases mélangées, c'est-à-dire de déterminer les états cachés $Z={z_1,z_2,…,z_T}$ associés à $X=(x_{1},x_{2},\dots,x_{T})$
+
+Pour rappel, on continue à utiliser la quantité $\log(1 + \text{estimation})$, sinon la vraisemblance peut devenir très petite et être interprétée par 0 par la machine.
+
+```{r}
+logprobmarkov_forapply <- function(param, sentence){
+  # Même fonction que logprob_markov mais avec comme argument une phrase qui n'est pas sous forme de vecteur de caractère
+  
+  # phrase sous forme de vecteur de caractère
+  vector_sentence = strsplit(sentence, split="") %>% unlist()
+  
+  # logprob_markov
+  res = logprob_markov(param, vector_sentence)
+  return(res)
+}
+
+build_emission <- function(dataset, MarkovFR, MarkovEN){
+  vector_sentences = as.vector(dataset)
+  
+  # On applique (sapply) logprob_markov (probabilité d'avoir telle phrase sachant telle langue) à chaque phrase et chaque langue
+  emission_fr = sapply(vector_sentences,
+                       FUN = function(x) logprobmarkov_forapply(MarkovFR,x)
+                       )
+  emission_en = sapply(vector_sentences,
+                       FUN = function(x) logprobmarkov_forapply(MarkovEN,x)
+                       )
+  
+  res = rbind(as.vector(emission_fr), as.vector(emission_en))
+  # Normalisation pour que la somme des lignes fasse 1
+  res = res/rowSums(res)
+  return(t(res)) 
+}
+
+# Test
+# print(build_emission(new_dataset$x, Markov_FR, Markov_EN))
+
+```
+
+```{r}
+viterbi_sentences <- function(Pi, A, X, MarkovFR, MarkovEN){
+  # Algorithme de Viterbi pour trouver les passages en français et en anglais du texte créé
+  
+  # Inputs :
+  # "Pi, A" : Paramètres de Markov pour les états cachés (distribution initiale et matrice de transition)
+  # "X" : Observations : colonne de dataframe stockant T phrases et leurs langues associées (X[i,] la i-ème phrase)
+  # "Markov_FR, Markov_EN" : Paramètres d'émission (pi et A) pour chaque état caché possible (langue)
+  
+  # Output : États cachés Z (langues : fr=1, en=2)
+  
+  
+  # Création de la matrice d'émission : on regarde X comme une variable à T modalités (T phrases observées). On crée alors une matrice B de taile TxK où B[i,j] est la "log (1+ probabilité) d'observer la phrase i dans l'état j
+  B = build_emission(X, MarkovFR, MarkovEN)
+  # print(B)
+  
+  # Algoritme de Viterbi
+  # rq : on aditionne B[t,l] car B contient déjà les logarithmes
+  
+  K = dim(A)[1] # K = 2 (fr, en)
+  T = length(X)
+  Z = rep(0,T)
+  S = matrix(rep(0, T*K),T,K)
+  logV = matrix(rep(-Inf, T*K),T,K)
+  logV[1,] = log(pi) + B[1,] # B est déjà une logprobabilité, pas besoin de faire logB, juste additionner B
+  #print(logV)
+  
+  # Forward
+  for (t in 2:T) { # t >=2
+    for (l in 1:K) {
+      logV[t,l] = max(logV[t-1,] + log(1+A[,l]) + B[t,l]) # B est déjà une logprobabilité, pas besoin de faire logB, juste additionner B
+      S[t-1,l] = which.max (logV[t-1,] + log(1+A[,l]) + B[t,l]) # B est déjà une logprobabilité, pas besoin de faire logB, juste additionner B
+      #print(logV)
+      #print(S)
+    }
+  }
+  
+  # Backward
+  Z[T] = which.max(logV[T,])
+  for (t in (T-1):1) {
+    Z[t] = S[t,Z[t+1]]
+  }
+  return(Z)
+}
+
+viterbi_result1 = viterbi_sentences(pi, A, new_dataset$x, Markov_FR, Markov_EN)
+
+```
+
+```{r}
+viterbi_result1
+# Vérification : Transformer les états (1,2) en variables y (-1,1)
+viterbi_result1 = 2*viterbi_result1 - 3
+
+# Matrice de confusion & scoring
+confusionMatrix(data=as.factor(viterbi_result1), reference = as.factor(new_dataset$y))
+
+```
+
+
+# Exercice 4bis - Décodage de langue par Viterbi
+
+Cette variante de notre exercice 4 est celle réellement demandée : Créer un texte d'au plus 1000 caractère et repérer les passage en anglais et français à l'aide de l'algorithme de Viterbi, en modélisant cette fois une $\textbf{chaine de markov cachee pour chaque caractere}$
+
+## Textes fabriqués
+
+On résutilise le même procédé qu'avant en prenant une probabilité uniforme de prendre des passages anglais ou français. Cela revient à créer un texte manuellement.
+
+```{r}
+text_made2 <- function(dataset_sentences){
+  # Génération d'un texte constitué de phrases anglaises et françaises tirées aléatoirement
+  
+  # Inputs : 
+  # "dataset_sentences" : Dataframe de phrases récupérées et langues associées
+
+  # Output : vecteur de caractère + vecteur des états pour chaque caractère (1 et 2)
+  
+  text.res = c()
+  lang.res = c()
+  
+  # Détermine les index français et anglais
+  indx_fr = which(dataset_sentences$y == -1)
+  indx_en = which(dataset_sentences$y == 1)
+  
+  # Index déjà pris pour chaque langue (phrases déjà sélectionnées)
+  indx_fr_taken = c()
+  indx_en_taken = c()
+  
+  # Nombre de caractères du texte après ajout de la phrase
+  len = 0
+
+  # Tant que le texte créé ne fait pas plus de 1 000 caractères
+  while(len<=1000){
+    Z = sample.int(2, 1) # etat 1 : fr, etat 2 : en
+    if (Z==1){
+      if (length(indx_fr_taken)==0){ new_indx = sample(indx_fr, 1) }
+      else{ new_indx = sample(indx_fr[-indx_fr_taken], 1) }
+      indx_fr_taken = c(indx_fr_taken,new_indx)
+    }
+    else{
+      if (length(indx_en_taken)==0){ new_indx = sample(indx_en, 1) }
+      else{ new_indx = sample(indx_en[-indx_en_taken], 1) }
+      indx_en_taken = c(indx_en_taken,new_indx)
+    }
+    new_sentence = dataset_sentences$x[new_indx] %>% as.vector()
+    
+    # Nombre de caractères du texte après ajout de la phrase
+    len = len + nchar(new_sentence) 
+
+    # Nouveau passage (vecteur de caractères)
+    new_sentence = strsplit(new_sentence, split = " ") %>% unlist()
+    new_sentence = paste(new_sentence, sep="")
+    new_sentence = strsplit(new_sentence, split = "") %>% unlist()
+
+    
+    # Ajout aux résultats (vecteur de caractères et d'états)
+    text.res = c(text.res, new_sentence)
+    lang.res = c(lang.res, rep(Z, length(new_sentence)))
+  }
+  
+  # Sélection des phrases & de la langue associée
+  return(list(
+    "text" = text.res,
+    "lang" = lang.res))
+}
+manual_text = text_made2(dataset_sentences)
+# Aperçu
+print(manual_text$text)
+length(manual_text$text)
+length(manual_text$lang)
+```
+
+## Chaine de Markov cachée & Emission
+
+On prépare les paramètres pour modéliser la chaine de Markov cachée : Matrice de Transition, Distribution initiale et Matrice d'emission.
+
+```{r}
+# Déterminer les paramètres de la chaine de Markov cachée
+alpha = 0.9
+pi = rep(1/2,2)
+markov_param = list( 
+  "init_distrib" = pi,
+  "mat_transition" = matrix(c(alpha, 1-alpha, 1-alpha, alpha), 2)
+  )
+
+print(markov_param)
+
+# Matrice d'emission à partir des fréquence de que caractère pour le français et l'anglais
+emission_fr = dataset_unigrams$fr / sum(dataset_unigrams$fr)
+emission_en = dataset_unigrams$en / sum(dataset_unigrams$en)
+emission = cbind(emission_fr, emission_en)
+rownames(emission) = c("a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z")
+print(emission)
+```
+
+## Algorithme de Viterbi
+
+```{r}
+Viterbi_caractere <- function(Pi,A,B,X){
+  # Algorithme de Viterbi pour trouver les passages en français et en anglais du texte créé
+  
+  # Inputs :
+  # "Pi, A" : Paramètres de Markov pour les états cachés (distribution initiale et matrice de transition)
+  # "X" : Observations : vecteur de caractères
+  # "B" : Matrice d'emission
+  
+  # Output : États cachés Z (langues : fr=1, en=2)
+  
+  K = dim(A)[1] # K = 2 (fr, en)
+  T = length(X)
+  Z = rep(0,T)
+  S = matrix(rep(0, T*K),T,K)
+  logV = matrix(rep(-Inf, T*K),T,K)
+  logV[1,] = log(pi*B[X[1],])
+  #print(logV)
+  
+  # Forward
+  for (t in 2:T) { # t >=2
+    for (l in 1:K) {
+      logV[t,l] = max(logV[t-1,] + log(A[,l]) + log(B[X[t],l]))
+      S[t-1,l] = which.max (logV[t-1,] + log(A[,l]) + log(B[X[t],l]))
+      #print(logV)
+      #print(S)
+    }
+  }
+  
+  # Backward
+  Z[T] = which.max(logV[T,])
+  for (t in (T-1):1) {
+    Z[t] = S[t,Z[t+1]]
+  }
+  
+  return(Z)
+}
+viterbi_result2 = Viterbi_caractere(markov_param$init_distrib, markov_param$mat_transition, emission, manual_text$text)
+print(viterbi_result2)
+```
+
+```{r}
+# Matrice de confusion & scoring
+confusionMatrix(data=as.factor(viterbi_result2), reference = as.factor(manual_text$lang))
+```
+
+
+En guise de commentaire, on peut dire qu'on trouve une accuracy relativement bonne (0.97 au premier essai). 
+
